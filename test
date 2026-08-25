@@ -1,0 +1,617 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+groups:
+  - docker
+
+system_info:
+  default_user:
+    groups:
+      - docker
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - jq
+  - lsb-release
+  - openssl
+  - python3
+  - python3-pip
+  - tar
+  - unattended-upgrades
+  - wget
+
+write_files:
+  #############################################################
+  # Python script used to generate the GitHub App JWT
+  #############################################################
+  - path: /usr/local/bin/create-app-jwt.py
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env python3
+
+      import base64
+      import json
+      import os
+      import subprocess
+      import time
+
+
+      def b64url(data):
+          if isinstance(data, str):
+              data = data.encode()
+
+          return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+      app_id = os.environ["APP_ID"]
+      key_path = os.environ["PRIVATE_KEY_PATH"]
+
+      now = int(time.time())
+
+      header = b64url(
+          json.dumps(
+              {
+                  "alg": "RS256",
+                  "typ": "JWT"
+              },
+              separators=(",", ":")
+          )
+      )
+
+      payload = b64url(
+          json.dumps(
+              {
+                  "iss": app_id,
+                  "iat": now - 60,
+                  "exp": now + 540
+              },
+              separators=(",", ":")
+          )
+      )
+
+      unsigned_token = f"{header}.{payload}"
+
+      signature = subprocess.run(
+          [
+              "openssl",
+              "dgst",
+              "-binary",
+              "-sha256",
+              "-sign",
+              key_path
+          ],
+          input=unsigned_token.encode(),
+          capture_output=True,
+          check=True
+      ).stdout
+
+      print(f"{unsigned_token}.{b64url(signature)}")
+
+  #############################################################
+  # Main GitHub Actions runner bootstrap script
+  #############################################################
+  - path: /usr/local/bin/bootstrap-runner.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+
+      set -Eeuo pipefail
+
+      #########################################################
+      # Test mode
+      #########################################################
+
+      # TEST_MODE=0:
+      # Performs actual Azure authentication, Key Vault access,
+      # GitHub registration and service installation.
+      #
+      # TEST_MODE=1:
+      # Skips Azure managed identity login.
+      # Gets GitHub values from environment variables.
+      # Skips final runner registration and service startup.
+
+      TEST_MODE="${TEST_MODE:-0}"
+
+      #########################################################
+      # Logging
+      #########################################################
+
+      log() {
+        echo "[$(date -Is)] ############ $*"
+      }
+
+      fail() {
+        echo "[$(date -Is)] ERROR: @@@@@@@@@@@@ $*" >&2
+        exit 1
+      }
+
+      error_handler() {
+        local exit_code=$?
+        local line_number=$1
+
+        echo "[$(date -Is)] ERROR: Bootstrap failed at line ${line_number} with exit code ${exit_code}" >&2
+        exit "${exit_code}"
+      }
+
+      trap 'error_handler ${LINENO}' ERR
+
+      #########################################################
+      # Configuration
+      #
+      # Replace these values for your sandbox.
+      #########################################################
+
+      GITHUB_ORG="internal"
+
+      KEYVAULT_NAME="kv-pa-mgt-scus-03"
+
+      APP_ID_SECRET_NAME="ghe-cid-app-id"
+
+      INSTALLATION_ID_SECRET_NAME="ghe-cid-srsinternal-installation-id"
+
+      PRIVATE_KEY_SECRET_NAME="ghe-cid-private-key"
+
+      RUNNER_VERSION="2.332.0"
+
+      #########################################################
+      # Install Docker
+      #########################################################
+
+      install_docker() {
+        if command -v docker >/dev/null 2>&1; then
+          log "Docker is already installed"
+        else
+          log "Installing Docker"
+
+          curl -fsSL https://get.docker.com | sh
+        fi
+
+        log "Adding hemant to the Docker group"
+
+        usermod -aG docker hemant
+
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping Docker service startup"
+          return 0
+        fi
+
+        log "Enabling and starting Docker"
+
+        systemctl enable --now docker
+      }
+
+      #########################################################
+      # Install Azure CLI
+      #########################################################
+
+      install_azure_cli() {
+        if command -v az >/dev/null 2>&1; then
+          log "Azure CLI is already installed"
+          return 0
+        fi
+
+        log "Installing Azure CLI"
+
+        curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+      }
+
+      #########################################################
+      # Install GitHub CLI
+      #########################################################
+
+      install_github_cli() {
+        if command -v gh >/dev/null 2>&1; then
+          log "GitHub CLI is already installed"
+          return 0
+        fi
+
+        log "Installing GitHub CLI"
+
+        mkdir -p -m 755 /etc/apt/keyrings
+
+        wget -qO- \
+          https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          >/dev/null
+
+        chmod go+r \
+          /etc/apt/keyrings/githubcli-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          | tee /etc/apt/sources.list.d/github-cli.list \
+          >/dev/null
+
+        apt-get update -q
+
+        DEBIAN_FRONTEND=noninteractive \
+          apt-get install -y gh
+      }
+
+      #########################################################
+      # Azure managed identity authentication
+      #########################################################
+
+      azure_managed_identity_login() {
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping Azure managed identity login"
+          return 0
+        fi
+
+        log "Logging in to Azure with the VM managed identity"
+
+        az login \
+          --identity \
+          --allow-no-subscriptions \
+          >/dev/null
+
+        log "Azure managed identity login completed"
+      }
+
+      #########################################################
+      # Read secret from Azure Key Vault
+      #########################################################
+
+      get_secret() {
+        local secret_name="$1"
+
+        if [[ "$TEST_MODE" == "1" ]]; then
+          case "$secret_name" in
+            "$APP_ID_SECRET_NAME")
+              printf '%s\n' "${APP_ID:-}"
+              ;;
+
+            "$INSTALLATION_ID_SECRET_NAME")
+              printf '%s\n' "${INSTALLATION_ID:-}"
+              ;;
+
+            "$PRIVATE_KEY_SECRET_NAME")
+              printf '%s\n' "${PRIVATE_KEY:-}"
+              ;;
+
+            *)
+              fail "Unknown secret requested in TEST_MODE: ${secret_name}"
+              ;;
+          esac
+
+          return 0
+        fi
+
+        az keyvault secret show \
+          --vault-name "$KEYVAULT_NAME" \
+          --name "$secret_name" \
+          --query value \
+          --output tsv
+      }
+
+      #########################################################
+      # Validate values from Key Vault
+      #########################################################
+
+      validate_github_values() {
+        [[ -n "${APP_ID:-}" ]] \
+          || fail "GitHub App ID is empty"
+
+        [[ -n "${INSTALLATION_ID:-}" ]] \
+          || fail "GitHub App installation ID is empty"
+
+        [[ -n "${PRIVATE_KEY:-}" ]] \
+          || fail "GitHub App private key is empty"
+
+        [[ "$APP_ID" =~ ^[0-9]+$ ]] \
+          || fail "GitHub App ID must be numeric"
+
+        [[ "$INSTALLATION_ID" =~ ^[0-9]+$ ]] \
+          || fail "GitHub App installation ID must be numeric"
+
+        grep -q "BEGIN.*PRIVATE KEY" <<<"$PRIVATE_KEY" \
+          || fail "The Key Vault private-key secret does not contain a valid PEM key"
+      }
+
+      #########################################################
+      # Create GitHub App JWT
+      #########################################################
+
+      create_app_jwt() {
+        APP_ID="$APP_ID" \
+        PRIVATE_KEY_PATH="$PRIVATE_KEY_PATH" \
+          python3 /usr/local/bin/create-app-jwt.py
+      }
+
+      #########################################################
+      # Create GitHub App installation access token
+      #########################################################
+
+      create_installation_token() {
+        local output
+        local return_code=0
+
+        output="$(
+          GH_TOKEN="$APP_JWT" \
+            gh api \
+              --method POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "/app/installations/${INSTALLATION_ID}/access_tokens" \
+              --jq ".token" \
+              2>&1
+        )" || return_code=$?
+
+        if [[ "$return_code" -eq 0 ]]; then
+          printf '%s\n' "$output"
+          return 0
+        fi
+
+        if [[ "$TEST_MODE" == "1" ]] &&
+           grep -q "HTTP 401" <<<"$output"; then
+
+          log "TEST_MODE=1, expected HTTP 401 received for installation token"
+          return 0
+        fi
+
+        printf '%s\n' "$output" >&2
+        return "$return_code"
+      }
+
+      #########################################################
+      # Create runner registration token
+      #########################################################
+
+      create_registration_token() {
+        local output
+        local return_code=0
+
+        output="$(
+          GH_TOKEN="$INSTALLATION_TOKEN" \
+            gh api \
+              --method POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "/orgs/${GITHUB_ORG}/actions/runners/registration-token" \
+              --jq ".token" \
+              2>&1
+        )" || return_code=$?
+
+        if [[ "$return_code" -eq 0 ]]; then
+          printf '%s\n' "$output"
+          return 0
+        fi
+
+        if [[ "$TEST_MODE" == "1" ]] &&
+           grep -q "HTTP 401" <<<"$output"; then
+
+          log "TEST_MODE=1, expected HTTP 401 received for registration token"
+          return 0
+        fi
+
+        printf '%s\n' "$output" >&2
+        return "$return_code"
+      }
+
+      #########################################################
+      # Download and extract GitHub Actions runner
+      #########################################################
+
+      install_runner() {
+        local runner_directory="/opt/actions-runner"
+        local runner_archive
+        local runner_url
+
+        runner_archive="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+
+        runner_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${runner_archive}"
+
+        if [[ -x "${runner_directory}/config.sh" ]]; then
+          log "GitHub Actions runner is already extracted"
+          return 0
+        fi
+
+        log "Creating runner installation directory"
+
+        mkdir -p "$runner_directory"
+
+        cd "$runner_directory"
+
+        log "Downloading GitHub Actions runner ${RUNNER_VERSION}"
+
+        curl \
+          --fail \
+          --show-error \
+          --location \
+          --retry 3 \
+          --output "$runner_archive" \
+          "$runner_url"
+
+        log "Extracting GitHub Actions runner"
+
+        tar xzf "$runner_archive"
+
+        rm -f "$runner_archive"
+
+        chown -R hemant:hemant "$runner_directory"
+      }
+
+      #########################################################
+      # Configure runner
+      #########################################################
+
+      configure_runner() {
+        local runner_directory="/opt/actions-runner"
+
+        log "Configuring GitHub Actions runner $(hostname)"
+
+        cd "$runner_directory"
+
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping config.sh execution"
+
+          [[ -x ./config.sh ]] \
+            || fail "config.sh was not found or is not executable"
+
+          return 0
+        fi
+
+        if [[ -f ".runner" ]]; then
+          log "Runner is already configured"
+          return 0
+        fi
+
+        sudo -u hemant \
+          ./config.sh \
+            --unattended \
+            --replace \
+            --url "https://github.com/${GITHUB_ORG}" \
+            --token "${REGISTRATION_TOKEN}" \
+            --name "$(hostname)" \
+            --runnergroup "Default" \
+            --labels "sandbox,azure,ubuntu,github-actions" \
+            --work "_work" \
+            --ephemeral
+      }
+
+      #########################################################
+      # Install and start runner service
+      #########################################################
+
+      start_runner_service() {
+        local runner_directory="/opt/actions-runner"
+
+        log "Preparing GitHub Actions runner service"
+
+        cd "$runner_directory"
+
+        ./bin/installdependencies.sh || true
+
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping service installation and startup"
+          return 0
+        fi
+
+        if compgen -G "/etc/systemd/system/actions.runner.*.service" >/dev/null; then
+          log "GitHub Actions runner service is already installed"
+        else
+          log "Installing GitHub Actions runner service for hemant"
+
+          ./svc.sh install hemant
+        fi
+
+        log "Starting GitHub Actions runner service"
+
+        ./svc.sh start
+      }
+
+      #########################################################
+      # Clean temporary sensitive information
+      #########################################################
+
+      cleanup() {
+        if [[ -n "${PRIVATE_KEY_PATH:-}" ]]; then
+          rm -f "$PRIVATE_KEY_PATH"
+        fi
+
+        unset PRIVATE_KEY
+        unset APP_JWT
+        unset INSTALLATION_TOKEN
+        unset REGISTRATION_TOKEN
+      }
+
+      #########################################################
+      # Main execution
+      #########################################################
+
+      main() {
+        log "Bootstrap started with TEST_MODE=${TEST_MODE}"
+
+        install_docker
+        install_azure_cli
+        install_github_cli
+        azure_managed_identity_login
+
+        log "Retrieving GitHub App ID from Azure Key Vault"
+
+        APP_ID="$(
+          get_secret "$APP_ID_SECRET_NAME"
+        )"
+
+        log "Retrieving GitHub App installation ID from Azure Key Vault"
+
+        INSTALLATION_ID="$(
+          get_secret "$INSTALLATION_ID_SECRET_NAME"
+        )"
+
+        log "Retrieving GitHub App private key from Azure Key Vault"
+
+        PRIVATE_KEY="$(
+          get_secret "$PRIVATE_KEY_SECRET_NAME"
+        )"
+
+        validate_github_values
+
+        PRIVATE_KEY_PATH="/tmp/github-app.pem"
+
+        printf '%s\n' "$PRIVATE_KEY" > "$PRIVATE_KEY_PATH"
+
+        chmod 600 "$PRIVATE_KEY_PATH"
+
+        log "Creating GitHub App JWT"
+
+        APP_JWT="$(
+          create_app_jwt
+        )"
+
+        [[ -n "$APP_JWT" ]] \
+          || fail "Failed to create the GitHub App JWT"
+
+        log "Creating GitHub App installation token"
+
+        INSTALLATION_TOKEN="$(
+          create_installation_token
+        )"
+
+        if [[ "$TEST_MODE" != "1" ]]; then
+          [[ -n "$INSTALLATION_TOKEN" ]] \
+            || fail "GitHub App installation token is empty"
+
+          [[ "$INSTALLATION_TOKEN" != "null" ]] \
+            || fail "GitHub App installation token is null"
+        else
+          INSTALLATION_TOKEN="${INSTALLATION_TOKEN:-TEST_INSTALLATION_TOKEN}"
+        fi
+
+        log "Creating GitHub Actions runner registration token"
+
+        REGISTRATION_TOKEN="$(
+          create_registration_token
+        )"
+
+        if [[ "$TEST_MODE" != "1" ]]; then
+          [[ -n "$REGISTRATION_TOKEN" ]] \
+            || fail "Runner registration token is empty"
+
+          [[ "$REGISTRATION_TOKEN" != "null" ]] \
+            || fail "Runner registration token is null"
+        else
+          REGISTRATION_TOKEN="${REGISTRATION_TOKEN:-TEST_REGISTRATION_TOKEN}"
+        fi
+
+        install_runner
+        configure_runner
+        start_runner_service
+        cleanup
+
+        log "GitHub Actions runner bootstrap completed successfully"
+      }
+
+      main "$@"
+
+runcmd:
+  - [bash, -lc, "/usr/local/bin/bootstrap-runner.sh > /var/log/bootstrap-runner.log 2>&1"]
+
+final_message: "GitHub Actions runner cloud-init completed after $UPTIME seconds"
