@@ -1,78 +1,8 @@
 ###################################################
-# Local Bootstrap Scripts
+# Local Bootstrap Script - Tools VM
 ###################################################
 
 locals {
-  #################################################
-  # Trivy Installation Script
-  # Runs only on the GitHub Actions VM
-  #################################################
-
-  install_trivy_script = <<-SCRIPT
-    #!/usr/bin/env bash
-
-    set -Eeuo pipefail
-
-    LOG_FILE="/var/log/install-trivy.log"
-
-    exec > >(tee -a "$${LOG_FILE}") 2>&1
-
-    echo "[$(date -Is)] Starting Trivy installation"
-
-    export DEBIAN_FRONTEND=noninteractive
-
-    wait_for_apt() {
-      echo "[$(date -Is)] Waiting for existing apt/dpkg operations"
-
-      while \
-        fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-        fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-        fuser /var/cache/apt/archives/lock >/dev/null 2>&1 || \
-        fuser /var/lib/apt/lists/lock >/dev/null 2>&1
-      do
-        sleep 10
-      done
-    }
-
-    if command -v trivy >/dev/null 2>&1; then
-      echo "[$(date -Is)] Trivy already installed"
-      trivy --version
-      exit 0
-    fi
-
-    wait_for_apt
-
-    apt-get update -y
-    apt-get install -y wget apt-transport-https gnupg ca-certificates
-
-    mkdir -p /usr/share/keyrings
-
-    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-      | gpg --dearmor \
-      | tee /usr/share/keyrings/trivy.gpg >/dev/null
-
-    chmod 644 /usr/share/keyrings/trivy.gpg
-
-    echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
-      > /etc/apt/sources.list.d/trivy.list
-
-    wait_for_apt
-
-    apt-get update -y
-    apt-get install -y trivy
-
-    echo "[$(date -Is)] Trivy installation completed"
-
-    trivy --version
-  SCRIPT
-
-  #################################################
-  # Tools VM Installation Script
-  # Installs Docker and starts:
-  # 1. SonarQube
-  # 2. Nexus Repository
-  #################################################
-
   install_tools_script = <<-SCRIPT
     #!/usr/bin/env bash
 
@@ -111,18 +41,23 @@ locals {
       jq \
       lsb-release
 
+    #################################################
+    # Install Docker
+    #################################################
+
     if ! command -v docker >/dev/null 2>&1; then
       echo "[$(date -Is)] Installing Docker"
 
       curl -fsSL https://get.docker.com | sh
     else
-      echo "[$(date -Is)] Docker already installed"
+      echo "[$(date -Is)] Docker is already installed"
     fi
 
     systemctl enable docker
     systemctl start docker
 
     echo "[$(date -Is)] Docker version"
+
     docker --version
 
     #################################################
@@ -135,7 +70,7 @@ locals {
     docker volume create nexus_data
 
     #################################################
-    # SonarQube host configuration
+    # Configure host requirements for SonarQube
     #################################################
 
     sysctl -w vm.max_map_count=524288
@@ -147,19 +82,24 @@ locals {
     EOF
 
     #################################################
-    # Docker network
+    # Create Docker network
     #################################################
 
     if ! docker network inspect devops-tools >/dev/null 2>&1; then
+      echo "[$(date -Is)] Creating Docker network: devops-tools"
+
       docker network create devops-tools
+    else
+      echo "[$(date -Is)] Docker network devops-tools already exists"
     fi
 
     #################################################
-    # SonarQube container
+    # Deploy SonarQube container
     #################################################
 
     if docker ps -a --format '{{.Names}}' | grep -qx sonarqube; then
       echo "[$(date -Is)] Removing existing SonarQube container"
+
       docker rm -f sonarqube
     fi
 
@@ -181,19 +121,20 @@ locals {
       sonarqube:lts-community
 
     #################################################
-    # Nexus Repository container
+    # Deploy Nexus Repository container
     #################################################
 
     if docker ps -a --format '{{.Names}}' | grep -qx nexus; then
       echo "[$(date -Is)] Removing existing Nexus container"
+
       docker rm -f nexus
     fi
 
-    echo "[$(date -Is)] Pulling Nexus image"
+    echo "[$(date -Is)] Pulling Nexus Repository image"
 
     docker pull sonatype/nexus3:latest
 
-    echo "[$(date -Is)] Starting Nexus container"
+    echo "[$(date -Is)] Starting Nexus Repository container"
 
     docker run -d \
       --name nexus \
@@ -205,7 +146,7 @@ locals {
       sonatype/nexus3:latest
 
     #################################################
-    # Validation
+    # Validate running containers
     #################################################
 
     echo "[$(date -Is)] Running containers"
@@ -237,33 +178,6 @@ resource "azurerm_public_ip" "github_vm" {
 }
 
 ###################################################
-# Network Security Group - GitHub Actions VM
-###################################################
-
-resource "azurerm_network_security_group" "github_vm" {
-  name                = "nsg-githubactions-dev-inc-01"
-  location            = azurerm_resource_group.github_app.location
-  resource_group_name = azurerm_resource_group.github_app.name
-
-  security_rule {
-    name                       = "Allow-SSH"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "22"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-
-  tags = {
-    Environment = "Dev"
-    Workload    = "GitHubActions"
-  }
-}
-
-###################################################
 # NIC - GitHub Actions VM
 ###################################################
 
@@ -286,15 +200,6 @@ resource "azurerm_network_interface" "github_vm" {
 }
 
 ###################################################
-# Associate NSG - GitHub Actions VM
-###################################################
-
-resource "azurerm_network_interface_security_group_association" "github_vm" {
-  network_interface_id      = azurerm_network_interface.github_vm.id
-  network_security_group_id = azurerm_network_security_group.github_vm.id
-}
-
-###################################################
 # VM - GitHub Actions
 ###################################################
 
@@ -310,10 +215,6 @@ resource "azurerm_linux_virtual_machine" "github_actions" {
 
   disable_password_authentication = false
 
-  #################################################
-  # Existing scripts/cloudinit.yaml
-  #################################################
-
   custom_data = base64encode(
     data.local_file.github_cloudinit.content
   )
@@ -321,10 +222,6 @@ resource "azurerm_linux_virtual_machine" "github_actions" {
   network_interface_ids = [
     azurerm_network_interface.github_vm.id
   ]
-
-  #################################################
-  # Required by az login --identity in cloud-init
-  #################################################
 
   identity {
     type = "SystemAssigned"
@@ -347,10 +244,6 @@ resource "azurerm_linux_virtual_machine" "github_actions" {
     Environment = "Dev"
     Workload    = "GitHubActions"
   }
-
-  depends_on = [
-    azurerm_network_interface_security_group_association.github_vm
-  ]
 }
 
 ###################################################
@@ -364,33 +257,6 @@ resource "azurerm_role_assignment" "github_vm_keyvault_secrets_user" {
 }
 
 ###################################################
-# Install Trivy - GitHub Actions VM
-###################################################
-
-resource "azurerm_virtual_machine_extension" "github_vm_trivy" {
-  name                       = "install-trivy"
-  virtual_machine_id         = azurerm_linux_virtual_machine.github_actions.id
-  publisher                  = "Microsoft.Azure.Extensions"
-  type                       = "CustomScript"
-  type_handler_version       = "2.1"
-  auto_upgrade_minor_version = true
-
-  protected_settings = jsonencode({
-    commandToExecute = "echo '${base64encode(local.install_trivy_script)}' | base64 -d > /tmp/install-trivy.sh && chmod 700 /tmp/install-trivy.sh && /tmp/install-trivy.sh"
-  })
-
-  tags = {
-    Environment = "Dev"
-    Workload    = "GitHubActions"
-    Tool        = "Trivy"
-  }
-
-  depends_on = [
-    azurerm_role_assignment.github_vm_keyvault_secrets_user
-  ]
-}
-
-###################################################
 # Public IP - Tools VM
 ###################################################
 
@@ -401,57 +267,6 @@ resource "azurerm_public_ip" "tools_vm" {
 
   allocation_method = "Static"
   sku               = "Standard"
-
-  tags = {
-    Environment = "Dev"
-    Workload    = "Tools"
-  }
-}
-
-###################################################
-# Network Security Group - Tools VM
-###################################################
-
-resource "azurerm_network_security_group" "tools_vm" {
-  name                = "nsg-tools-dev-sa-01"
-  location            = azurerm_resource_group.k8s_app.location
-  resource_group_name = azurerm_resource_group.k8s_app.name
-
-  security_rule {
-    name                       = "Allow-SSH"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "22"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-
-  security_rule {
-    name                       = "Allow-SonarQube"
-    priority                   = 110
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "9000"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-
-  security_rule {
-    name                       = "Allow-Nexus"
-    priority                   = 120
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "8081"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
 
   tags = {
     Environment = "Dev"
@@ -482,15 +297,6 @@ resource "azurerm_network_interface" "tools_vm" {
 }
 
 ###################################################
-# Associate NSG - Tools VM
-###################################################
-
-resource "azurerm_network_interface_security_group_association" "tools_vm" {
-  network_interface_id      = azurerm_network_interface.tools_vm.id
-  network_security_group_id = azurerm_network_security_group.tools_vm.id
-}
-
-###################################################
 # VM - Tools
 ###################################################
 
@@ -505,10 +311,6 @@ resource "azurerm_linux_virtual_machine" "tools" {
   admin_password = "Hemant@1234567"
 
   disable_password_authentication = false
-
-  #################################################
-  # No GitHub runner cloud-init on this VM
-  #################################################
 
   network_interface_ids = [
     azurerm_network_interface.tools_vm.id
@@ -531,10 +333,6 @@ resource "azurerm_linux_virtual_machine" "tools" {
     Environment = "Dev"
     Workload    = "Tools"
   }
-
-  depends_on = [
-    azurerm_network_interface_security_group_association.tools_vm
-  ]
 }
 
 ###################################################
