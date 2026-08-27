@@ -163,6 +163,11 @@ locals {
 # Public IP - GitHub Actions VM
 ###################################################
 
+provider "azurerm" {
+  features {}
+}
+
+
 resource "azurerm_public_ip" "github_vm" {
   name                = "pip-githubactions-dev-inc-01"
   location            = data.azurerm_resource_group.github_app.location
