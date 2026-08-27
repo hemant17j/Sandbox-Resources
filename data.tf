@@ -20,5 +20,5 @@ data "azurerm_resource_group" "github_app" {
 }
 
 data "azurerm_resource_group" "k8s_app" {
-  name = "rg-k8s-dev-sa-01"
+  name = "rg-k8sapp-dev-sa-01"
 }
