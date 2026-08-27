@@ -1,0 +1,390 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+groups:
+  - docker
+
+system_info:
+  default_user:
+    groups: [ docker ]
+
+users:
+  - default
+  - name: ghe-runner
+    gecos: GitHub Actions Runner
+    shell: /bin/bash
+    groups: [ docker ]
+    sudo: [ "ALL=(ALL) NOPASSWD:ALL" ]
+    lock_passwd: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - lsb-release
+  - python3
+  - python3-pip
+  - unattended-upgrades
+  - wget
+  - vim
+  - unzip
+
+write_files:
+  - path: /usr/local/bin/create-app-jwt.py
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      import base64, json, time, subprocess, os, sys
+
+      def b64url(data):
+          if isinstance(data, str):
+              data = data.encode()
+          return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+      client_id    = os.environ["CLIENT_ID"]
+      key_path     = os.environ["PRIVATE_KEY_PATH"]
+      now          = int(time.time())
+      header       = b64url(json.dumps({"alg":"RS256","typ":"JWT"}))
+      payload      = b64url(json.dumps({"iss":client_id,"iat":now-60,"exp":now+540}))
+      unsigned     = f"{header}.{payload}"
+
+      sig = subprocess.run(
+          ["openssl","dgst","-binary","-sha256","-sign", key_path],
+          input=unsigned.encode(), capture_output=True, check=True
+      ).stdout
+
+      print(f"{unsigned}.{b64url(sig)}")
+
+  - path: /usr/local/bin/bootstrap-runner.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+
+      # -----------------------------
+      # Mode
+      # -----------------------------
+      # TEST_MODE=1 enables Docker/test-friendly behavior:
+      # - Skips Azure managed identity login
+      # - Gets secrets from env instead of Key Vault
+      # - Skips Docker install & runner service install/start
+      TEST_MODE="${TEST_MODE:-0}"
+
+      # -----------------------------
+      # Logging
+      # -----------------------------
+      log() {
+        echo "[$(date -Is)] ############ $*"
+      }
+
+      fail() {
+        echo "[$(date -Is)] ERROR: @@@@@@@@@@@@ $*" >&2
+        exit 1
+      }
+
+      # -----------------------------
+      # Required settings
+      # -----------------------------
+      RUNNER_USER="${RUNNER_USER:-ghe-runner}"
+      GITHUB_ORG="hemant17j"
+      KEYVAULT_NAME="kv-github-dev-inc-01"
+      CLIENT_ID_SECRET_NAME="github-client-id"
+      INSTALLATION_ID_SECRET_NAME="github-installation-id"
+      PRIVATE_KEY_SECRET_NAME="github-private-key"
+      RUNNER_VERSION="2.317.0"
+      # Bump this version manually after changes to this script
+      SCRIPT_VERSION="0.0.9"
+
+      ##
+      # GitHub Enterprise Cloud with data residency API base
+      # If not using data residency, comment out lines below
+      ##
+      # export GH_HOST="srs.ghe.com"
+      # export GHE_BASE_URL="https://github.com"
+      
+      ##
+      # Default URL
+      # Comment out and use above for Data Residency tenant
+      ##
+      export GHE_BASE_URL="https://github.com"
+
+      # -----------------------------
+      # Docker
+      # -----------------------------
+      install_docker() {
+
+        log "Setting up Docker deps"
+        if command -v docker >/dev/null 2>&1; then
+          log "Docker already installed"
+          return
+        fi
+
+        log "Installing Docker"
+        curl -fsSL https://get.docker.com | sh
+
+        log "Enable/run Docker"
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping Docker enable in test mode"
+          return 0
+        fi
+        systemctl enable --now docker
+      }
+
+      # -----------------------------
+      # Azure CLI
+      # -----------------------------
+      install_azure_cli() {
+        if command -v az >/dev/null 2>&1; then
+          log "Azure CLI already installed"
+          return
+        fi
+
+        log "Installing Azure CLI"
+        curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+      }
+
+      # -----------------------------
+      # GitHub CLI
+      # -----------------------------
+      install_gh_cli() {
+        if command -v gh >/dev/null 2>&1; then
+          log "GitHub CLI already installed"
+          return
+        fi
+
+        log "Installing GitHub CLI"
+        mkdir -p -m 755 /etc/apt/keyrings
+        wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+        chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        apt-get update -q
+        apt-get install -y gh
+      }
+
+      # -----------------------------
+      # Azure managed identity login
+      # -----------------------------
+      az_login_identity() {
+        if [[ "$TEST_MODE" == "1" ]]; then
+          log "TEST_MODE=1, skipping Azure managed identity login"
+          return 0
+        fi
+
+        log "Logging into Azure with managed identity"
+        az login --identity --allow-no-subscriptions >/dev/null
+      }
+
+      get_secret() {
+        local name="$1"
+
+        if [[ "$TEST_MODE" == "1" ]]; then
+          case "$name" in
+            "$CLIENT_ID_SECRET_NAME") echo "${CLIENT_ID:-}" ;;
+            "$INSTALLATION_ID_SECRET_NAME") echo "${INSTALLATION_ID:-}" ;;
+            "$PRIVATE_KEY_SECRET_NAME") echo "${PRIVATE_KEY:-}" ;;
+            *) return 1 ;;
+          esac
+          return 0
+        fi
+
+        az keyvault secret show \
+          --vault-name "$KEYVAULT_NAME" \
+          --name "$name" \
+          --query value -o tsv
+      }
+
+      # -----------------------------
+      # GitHub App auth
+      # -----------------------------
+      create_app_jwt() {
+        CLIENT_ID="$CLIENT_ID" PRIVATE_KEY_PATH="$PRIVATE_KEY_PATH" \
+          python3 /usr/local/bin/create-app-jwt.py
+      }
+
+      decode_jwt() {
+        /tmp/render_jwt.sh $1
+      }
+
+      create_installation_token() {
+        # Here we use rendered JWT to fetch installation token.
+        # Note we cannot use only the GH_TOKEN variable, but must pass the
+        # JWT as Bearer to hit this API
+        
+        local output rc
+        output="$(
+          GH_TOKEN=${APP_JWT} gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${APP_JWT}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/app/installations/${INSTALLATION_ID}/access_tokens" \
+            --jq .token 2>&1
+        )" || rc=$?
+        rc="${rc:-0}"
+
+        if [[ "$rc" -eq 0 ]]; then
+          printf '%s\n' "$output"
+          return 0
+        fi
+
+        if [[ "${TEST_MODE:-0}" == "1" ]] && grep -q 'HTTP 401' <<<"$output"; then
+          log "TEST_MODE=1 and GitHub returned HTTP 401 for installation token; treating as expected"
+          return 0
+        fi
+
+        printf '%s\n' "$output" >&2
+        return "$rc"
+      }
+
+      create_registration_token() {
+        # Here we use rendered installation token to fetch registration token.
+        # Note we use GH_TOKEN variable without Bearer to let gh call do it.
+        local output rc
+        output="$(
+          GH_TOKEN="$INSTALLATION_TOKEN" gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            "/orgs/${GITHUB_ORG}/actions/runners/registration-token" \
+            --jq .token 2>&1
+        )" || rc=$?
+        rc="${rc:-0}"
+
+        if [[ "$rc" -eq 0 ]]; then
+          printf '%s\n' "$output"
+          return 0
+        fi
+
+        if [[ "${TEST_MODE:-0}" == "1" ]] && grep -q 'HTTP 401' <<<"$output"; then
+          log "TEST_MODE=1 and GitHub returned HTTP 401 for registration token; treating as expected"
+          return 0
+        fi
+
+        printf '%s\n' "$output" >&2
+        return "$rc"
+      }
+
+      # -----------------------------
+      # Runner install
+      # -----------------------------
+      install_runner() {
+        local tarball="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+        local url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${tarball}"
+
+        log "Downloading runner"
+        mkdir -p /opt/actions-runner
+        cd /opt/actions-runner
+        curl -fsSL -o "${tarball}" "${url}"
+        tar xzf "${tarball}"
+
+        log "Setting ownership on /opt/actions-runner to ${RUNNER_USER}"
+        chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner
+      }
+
+      configure_runner() {
+        log "Configuring runner $(hostname) as ${RUNNER_USER}"
+
+        if [[ "${TEST_MODE:-0}" == "1" ]]; then
+          log "TEST_MODE=1, skipping config.sh execution"
+          test -x /opt/actions-runner/config.sh || fail "config.sh not found or not executable"
+          return 0
+        fi
+
+        sudo -u "${RUNNER_USER}" -H \
+          GHE_BASE_URL="${GHE_BASE_URL}" \
+          GITHUB_ORG="${GITHUB_ORG}" \
+          REGISTRATION_TOKEN="${REGISTRATION_TOKEN}" \
+          bash -lc '
+            set -Eeuo pipefail
+            cd /opt/actions-runner
+            ./config.sh \
+              --unattended \
+              --url "${GHE_BASE_URL}/${GITHUB_ORG}" \
+              --token "${REGISTRATION_TOKEN}" \
+              --name "$(hostname)" \
+              --runnergroup Default \
+              --work _work
+          '
+      }
+
+      start_runner_service() {
+        log "Preparing runner service"
+        cd /opt/actions-runner
+        ./bin/installdependencies.sh || true
+
+        if [[ "${TEST_MODE:-0}" == "1" ]]; then
+          log "TEST_MODE=1, skipping svc.sh install/start"
+          return 0
+        fi
+
+        log "Installing and starting runner service as ${RUNNER_USER}"
+        ./svc.sh install "${RUNNER_USER}"
+        ./svc.sh start
+      }
+
+      # -----------------------------
+      # Main
+      # -----------------------------
+      main() {
+        log "Bootstrap started (TEST_MODE=${TEST_MODE})"
+        log "Version $SCRIPT_VERSION of this cloudinit.yaml"
+
+        install_docker
+        install_azure_cli
+        install_gh_cli
+        az_login_identity
+
+        log "Fetching secrets"
+        CLIENT_ID="$(get_secret "$CLIENT_ID_SECRET_NAME")"
+        INSTALLATION_ID="$(get_secret "$INSTALLATION_ID_SECRET_NAME")"
+        PRIVATE_KEY="$(get_secret "$PRIVATE_KEY_SECRET_NAME")"
+
+        PRIVATE_KEY_PATH="/tmp/github-app.pem"
+        printf '%s\n' "$PRIVATE_KEY" > "$PRIVATE_KEY_PATH"
+        chmod 600 "$PRIVATE_KEY_PATH"
+
+        log "Creating GitHub App JWT"
+        APP_JWT="$(create_app_jwt)"
+        log "Completed function for creating GHEC JWT"
+
+        log "Creating installation token"
+        INSTALLATION_TOKEN="$(create_installation_token)"
+        log "Completed function for creating installation token"
+        if [[ "${TEST_MODE:-0}" != "1" ]]; then
+          [[ -n "$INSTALLATION_TOKEN" && "$INSTALLATION_TOKEN" != "null" ]] || fail "Failed to create installation token"
+        else
+          INSTALLATION_TOKEN="${INSTALLATION_TOKEN:-TEST_INSTALLATION_TOKEN}"
+        fi
+
+        log "Creating runner registration token"
+        REGISTRATION_TOKEN="$(create_registration_token)"
+        log "Completed function for creating runner registration token"
+        if [[ "${TEST_MODE:-0}" != "1" ]]; then
+          [[ -n "$REGISTRATION_TOKEN" && "$REGISTRATION_TOKEN" != "null" ]] || fail "Failed to create registration token"
+        else
+          REGISTRATION_TOKEN="${REGISTRATION_TOKEN:-TEST_REGISTRATION_TOKEN}"
+        fi
+
+        # Validate Runner User exists
+        id "${RUNNER_USER}" >/dev/null 2>&1 || fail "Runner user ${RUNNER_USER} does not exist"
+
+        install_runner
+        configure_runner
+        start_runner_service
+
+        rm -f "$PRIVATE_KEY_PATH"
+
+        log "Bootstrap complete"
+        log "Version $SCRIPT_VERSION of this cloudinit.yaml"
+      }
+
+      main "$@"
+
+runcmd:
+  - [ bash, -lc, "/usr/local/bin/bootstrap-runner.sh > /var/log/bootstrap-runner.log 2>&1" ]
+
+final_message: "The system is finally up, after $UPTIME seconds"
