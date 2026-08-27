@@ -12,7 +12,7 @@ data "local_file" "github_cloudinit" {
 
 data "azurerm_key_vault" "github" {
   name                = "kv-github-dev-inc-01"
-  resource_group_name = azurerm_resource_group.github_app.name
+  resource_group_name = data.azurerm_resource_group.github_app.name
 }
 
 data "azurerm_resource_group" "github_app" {
