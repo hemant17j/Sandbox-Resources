@@ -14,3 +14,11 @@ data "azurerm_key_vault" "github" {
   name                = "kv-github-dev-inc-01"
   resource_group_name = azurerm_resource_group.github_app.name
 }
+
+data "azurerm_resource_group" "github_app" {
+  name = "rg-github-dev-inc-01"
+}
+
+data "azurerm_resource_group" "k8s_app" {
+  name = "rg-k8s-dev-sa-01"
+}
