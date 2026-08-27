@@ -165,7 +165,7 @@ locals {
 
 resource "azurerm_public_ip" "github_vm" {
   name                = "pip-githubactions-dev-inc-01"
-  location            = dat.azurerm_resource_group.github_app.location
+  location            = data.azurerm_resource_group.github_app.location
   resource_group_name = data.azurerm_resource_group.github_app.name
 
   allocation_method = "Static"
