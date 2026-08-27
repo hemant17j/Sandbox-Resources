@@ -193,7 +193,7 @@ resource "azurerm_network_interface" "github_vm" {
 
   ip_configuration {
     name                          = "internal"
-    subnet_id                     = "snet-github-dev-inc-01"
+    subnet_id                     = "/subscriptions/0dc7d67a-e827-4efe-9d39-1bd05876e1cb/resourceGroups/rg-githubnet-dev-inc-01/providers/Microsoft.Network/virtualNetworks/vnet-github-dev-inc-01/subnets/snet-github-dev-inc-01"
     private_ip_address_allocation = "Dynamic"
     public_ip_address_id          = azurerm_public_ip.github_vm.id
   }
@@ -290,7 +290,7 @@ resource "azurerm_network_interface" "tools_vm" {
 
   ip_configuration {
     name                          = "internal"
-    subnet_id                     = "snet-k8sapp-dev-sa-01"
+    subnet_id                     = "/subscriptions/0dc7d67a-e827-4efe-9d39-1bd05876e1cb/resourceGroups/rg-k8sappnet-dev-sa-01/providers/Microsoft.Network/virtualNetworks/vnet-k8sapp-dev-sa-01/subnets/snet-k8sapp-dev-sa-01"
     private_ip_address_allocation = "Dynamic"
     public_ip_address_id          = azurerm_public_ip.tools_vm.id
   }
